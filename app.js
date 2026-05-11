@@ -1,5 +1,5 @@
 // ====== 可依需求調整的設定 ======
-const MODEL_URL = "best.onnx";
+const MODEL_URL = "Models/best.onnx";
 const LABELS_URL = "labels.json";
 const MODEL_INPUT_SIZE = 640; // 必須與 YOLOv8 匯出 ONNX 時的 imgsz 一致
 const IOU_THRESHOLD = 0.45;
