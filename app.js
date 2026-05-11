@@ -1,396 +1,472 @@
-// ====== 可依需求調整的設定 ======
-const MODEL_URL = "Models/best.onnx";
-const LABELS_URL = "labels.json";
-const MODEL_INPUT_SIZE = 640; // 必須與 YOLOv8 匯出 ONNX 時的 imgsz 一致
-const IOU_THRESHOLD = 0.45;
-let CONF_THRESHOLD = 0.25;
+// ===============================
+// YOLOv8 ONNX Web Object Detection
+// GitHub Pages 可用版本
+// ===============================
 
-// ====== DOM ======
-const modelStatus = document.getElementById("modelStatus");
-const imageInput = document.getElementById("imageInput");
-const cameraButton = document.getElementById("cameraButton");
-const stopCameraButton = document.getElementById("stopCameraButton");
-const confSlider = document.getElementById("confSlider");
-const confValue = document.getElementById("confValue");
-const video = document.getElementById("video");
-const sourceImage = document.getElementById("sourceImage");
-const canvas = document.getElementById("canvas");
-const ctx = canvas.getContext("2d");
-const summary = document.getElementById("summary");
-const counts = document.getElementById("counts");
-const detectionsBox = document.getElementById("detections");
+const MODEL_PATH = "models/best.onnx";
+
+// 若 ONNX 是用 imgsz=960 匯出，請改成 960。
+const INPUT_SIZE = 640;
+
+// 三種類別價值，必須對應 Roboflow / YOLO data.yaml 的類別順序。
+const CLASS_VALUES = {
+  0: 100,
+  1: 200,
+  2: 300
+};
+
+const CLASS_COLORS = ["#22c55e", "#f97316", "#38bdf8", "#e879f9", "#facc15", "#fb7185"];
 
 let session = null;
 let labels = [];
-let stream = null;
+let uploadedImage = null;
+let cameraStream = null;
+let cameraRunning = false;
 let animationId = null;
-let isRunningCamera = false;
-let lastInferTime = 0;
-const INFER_INTERVAL_MS = 120; // 數值越小越即時，但手機負擔越重
+let lastCameraDetectTime = 0;
+const CAMERA_DETECT_INTERVAL = 160;
 
-confSlider.addEventListener("input", () => {
-  CONF_THRESHOLD = Number(confSlider.value);
-  confValue.textContent = CONF_THRESHOLD.toFixed(2);
-});
+const imageInput = document.getElementById("imageInput");
+const detectImageBtn = document.getElementById("detectImageBtn");
+const startCameraBtn = document.getElementById("startCameraBtn");
+const stopCameraBtn = document.getElementById("stopCameraBtn");
+const confSlider = document.getElementById("confSlider");
+const iouSlider = document.getElementById("iouSlider");
+const confValue = document.getElementById("confValue");
+const iouValue = document.getElementById("iouValue");
+const statusEl = document.getElementById("status");
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const statsBody = document.getElementById("statsBody");
+const totalCountEl = document.getElementById("totalCount");
+const totalValueEl = document.getElementById("totalValue");
+
+init();
 
 async function init() {
+  setButtonsDisabled(true);
+  updateStatus("正在載入 labels.json 與 ONNX 模型...");
+
   try {
-    modelStatus.textContent = "模型載入中...";
+    labels = await loadLabels();
+    initStatsTable();
 
-    labels = await fetch(LABELS_URL).then((r) => {
-      if (!r.ok) throw new Error("找不到 labels.json");
-      return r.json();
-    });
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+    session = await ort.InferenceSession.create(MODEL_PATH, { executionProviders: ["wasm"] });
 
-    // wasm 適合 GitHub Pages；若瀏覽器支援，onnxruntime-web 會自動使用可用能力。
-    session = await ort.InferenceSession.create(MODEL_URL, {
-      executionProviders: ["wasm"],
-      graphOptimizationLevel: "all",
-    });
-
-    modelStatus.textContent = "模型已載入";
-    modelStatus.className = "status ready";
-  } catch (err) {
-    console.error(err);
-    modelStatus.textContent = "模型載入失敗，請確認 best.onnx 路徑";
-    modelStatus.className = "status error";
-    summary.textContent = err.message;
+    updateStatus("模型載入完成。請上傳圖片或啟動手機後鏡頭。");
+    setButtonsDisabled(false);
+  } catch (error) {
+    console.error(error);
+    updateStatus("模型載入失敗。請確認 models/best.onnx 是否存在，且 labels.json 格式正確。");
   }
 }
+
+async function loadLabels() {
+  const response = await fetch("labels.json");
+  if (!response.ok) throw new Error("無法讀取 labels.json");
+  return await response.json();
+}
+
+function setButtonsDisabled(disabled) {
+  detectImageBtn.disabled = disabled;
+  startCameraBtn.disabled = disabled;
+  stopCameraBtn.disabled = disabled;
+}
+
+function updateStatus(message) {
+  statusEl.textContent = message;
+}
+
+confSlider.addEventListener("input", () => {
+  confValue.textContent = Number(confSlider.value).toFixed(2);
+});
+
+iouSlider.addEventListener("input", () => {
+  iouValue.textContent = Number(iouSlider.value).toFixed(2);
+});
 
 imageInput.addEventListener("change", async (event) => {
   const file = event.target.files?.[0];
   if (!file) return;
-  stopCamera();
 
-  const url = URL.createObjectURL(file);
-  sourceImage.onload = async () => {
-    URL.revokeObjectURL(url);
-    video.style.display = "none";
-    sourceImage.style.display = "none";
-    await detectAndDraw(sourceImage);
-  };
-  sourceImage.src = url;
+  stopCamera();
+  uploadedImage = await loadImageFromFile(file);
+  drawSourceToCanvas(uploadedImage);
+  updateStatus("圖片已載入，請按「辨識上傳圖片」。");
 });
 
-cameraButton.addEventListener("click", startCamera);
-stopCameraButton.addEventListener("click", stopCamera);
-
-async function startCamera() {
-  if (!session) {
-    alert("模型尚未載入完成");
+detectImageBtn.addEventListener("click", async () => {
+  if (!uploadedImage) {
+    updateStatus("請先選擇一張圖片。");
     return;
   }
+  await detectStillImage(uploadedImage);
+});
 
+startCameraBtn.addEventListener("click", async () => {
+  await startCamera();
+});
+
+stopCameraBtn.addEventListener("click", () => {
+  stopCamera();
+  updateStatus("鏡頭已停止。");
+});
+
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+function drawSourceToCanvas(source) {
+  const maxWidth = 1280;
+  const scale = Math.min(1, maxWidth / source.width);
+  canvas.width = Math.round(source.width * scale);
+  canvas.height = Math.round(source.height * scale);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+}
+
+async function detectStillImage(image) {
+  if (!session) return;
+  updateStatus("圖片辨識中...");
+
+  drawSourceToCanvas(image);
+  const detections = await runDetection(canvas);
+
+  drawSourceToCanvas(image);
+  drawDetections(ctx, detections);
+  drawStatsPanel(ctx, detections);
+  updateStatsTable(detections);
+
+  updateStatus(`辨識完成，共偵測到 ${detections.length} 個物件。`);
+}
+
+async function startCamera() {
+  if (!session) return;
   stopCamera();
 
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
+    updateStatus("正在啟動手機後鏡頭...");
+    cameraStream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: "environment" },
         width: { ideal: 1280 },
-        height: { ideal: 720 },
+        height: { ideal: 720 }
       },
-      audio: false,
+      audio: false
     });
 
-    video.srcObject = stream;
-    video.style.display = "none";
-    sourceImage.style.display = "none";
+    video.srcObject = cameraStream;
     await video.play();
-
-    isRunningCamera = true;
-    cameraButton.disabled = true;
-    stopCameraButton.disabled = false;
-    runCameraLoop();
-  } catch (err) {
-    console.error(err);
-    alert("無法開啟鏡頭。請確認網頁為 HTTPS，並允許瀏覽器使用相機。" + err.message);
+    cameraRunning = true;
+    uploadedImage = null;
+    updateStatus("鏡頭已啟動，正在即時辨識...");
+    detectCameraLoop();
+  } catch (error) {
+    console.error(error);
+    updateStatus("無法啟動鏡頭。請確認瀏覽器權限，並使用 HTTPS 或 GitHub Pages 開啟。");
   }
 }
 
 function stopCamera() {
-  isRunningCamera = false;
-  if (animationId) cancelAnimationFrame(animationId);
-  animationId = null;
-
-  if (stream) {
-    stream.getTracks().forEach((track) => track.stop());
-    stream = null;
+  cameraRunning = false;
+  if (animationId) {
+    cancelAnimationFrame(animationId);
+    animationId = null;
   }
-
-  cameraButton.disabled = false;
-  stopCameraButton.disabled = true;
+  if (cameraStream) {
+    cameraStream.getTracks().forEach((track) => track.stop());
+    cameraStream = null;
+  }
+  video.srcObject = null;
 }
 
-async function runCameraLoop(time = 0) {
-  if (!isRunningCamera) return;
+async function detectCameraLoop(timestamp = 0) {
+  if (!cameraRunning) return;
 
-  if (time - lastInferTime >= INFER_INTERVAL_MS) {
-    lastInferTime = time;
-    await detectAndDraw(video);
-  }
+  if (video.videoWidth > 0 && video.videoHeight > 0) {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  animationId = requestAnimationFrame(runCameraLoop);
-}
-
-async function detectAndDraw(source) {
-  if (!session) return;
-
-  const originalWidth = source.videoWidth || source.naturalWidth || source.width;
-  const originalHeight = source.videoHeight || source.naturalHeight || source.height;
-  if (!originalWidth || !originalHeight) return;
-
-  canvas.width = originalWidth;
-  canvas.height = originalHeight;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
-
-  const { tensor, scale, padX, padY } = preprocess(source, originalWidth, originalHeight);
-  const feeds = { [session.inputNames[0]]: tensor };
-  const outputMap = await session.run(feeds);
-  const output = outputMap[session.outputNames[0]];
-
-  const detections = postprocess(output, originalWidth, originalHeight, scale, padX, padY);
-  drawDetections(detections);
-  renderResults(detections);
-}
-
-function preprocess(source, originalWidth, originalHeight) {
-  const inputCanvas = document.createElement("canvas");
-  inputCanvas.width = MODEL_INPUT_SIZE;
-  inputCanvas.height = MODEL_INPUT_SIZE;
-  const inputCtx = inputCanvas.getContext("2d");
-
-  inputCtx.fillStyle = "rgb(114,114,114)";
-  inputCtx.fillRect(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
-
-  const scale = Math.min(MODEL_INPUT_SIZE / originalWidth, MODEL_INPUT_SIZE / originalHeight);
-  const newWidth = Math.round(originalWidth * scale);
-  const newHeight = Math.round(originalHeight * scale);
-  const padX = Math.floor((MODEL_INPUT_SIZE - newWidth) / 2);
-  const padY = Math.floor((MODEL_INPUT_SIZE - newHeight) / 2);
-
-  inputCtx.drawImage(source, padX, padY, newWidth, newHeight);
-  const imageData = inputCtx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE).data;
-
-  const input = new Float32Array(1 * 3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE);
-  const pixels = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
-
-  for (let i = 0; i < pixels; i++) {
-    input[i] = imageData[i * 4] / 255; // R
-    input[i + pixels] = imageData[i * 4 + 1] / 255; // G
-    input[i + pixels * 2] = imageData[i * 4 + 2] / 255; // B
-  }
-
-  return {
-    tensor: new ort.Tensor("float32", input, [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE]),
-    scale,
-    padX,
-    padY,
-  };
-}
-
-function postprocess(output, originalWidth, originalHeight, scale, padX, padY) {
-  const data = output.data;
-  const dims = output.dims;
-
-  // YOLOv8 ONNX 常見輸出：[1, 4 + classCount, 8400]
-  // 有些模型可能是：[1, 8400, 4 + classCount]
-  let rows, cols, transposed;
-  if (dims.length === 3 && dims[1] < dims[2]) {
-    cols = dims[1];
-    rows = dims[2];
-    transposed = true;
-  } else if (dims.length === 3) {
-    rows = dims[1];
-    cols = dims[2];
-    transposed = false;
-  } else {
-    throw new Error("不支援的模型輸出維度：" + dims.join("x"));
-  }
-
-  const classCount = cols - 4;
-  const boxes = [];
-
-  for (let i = 0; i < rows; i++) {
-    let cx, cy, w, h;
-    if (transposed) {
-      cx = data[0 * rows + i];
-      cy = data[1 * rows + i];
-      w = data[2 * rows + i];
-      h = data[3 * rows + i];
-    } else {
-      const offset = i * cols;
-      cx = data[offset];
-      cy = data[offset + 1];
-      w = data[offset + 2];
-      h = data[offset + 3];
+    if (timestamp - lastCameraDetectTime > CAMERA_DETECT_INTERVAL) {
+      lastCameraDetectTime = timestamp;
+      try {
+        const detections = await runDetection(canvas);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        drawDetections(ctx, detections);
+        drawStatsPanel(ctx, detections);
+        updateStatsTable(detections);
+      } catch (error) {
+        console.error(error);
+      }
     }
+  }
+
+  animationId = requestAnimationFrame(detectCameraLoop);
+}
+
+async function runDetection(sourceCanvas) {
+  const confThreshold = Number(confSlider.value);
+  const iouThreshold = Number(iouSlider.value);
+
+  const { inputTensor, ratio, xPad, yPad } = preprocess(sourceCanvas);
+  const feeds = {};
+  feeds[session.inputNames[0]] = inputTensor;
+
+  const output = await session.run(feeds);
+  const outputTensor = output[session.outputNames[0]];
+
+  let detections = parseYOLOv8Output(outputTensor, confThreshold, sourceCanvas.width, sourceCanvas.height, ratio, xPad, yPad);
+  detections = nonMaxSuppression(detections, iouThreshold);
+  return detections;
+}
+
+function preprocess(sourceCanvas) {
+  const srcW = sourceCanvas.width;
+  const srcH = sourceCanvas.height;
+  const ratio = Math.min(INPUT_SIZE / srcW, INPUT_SIZE / srcH);
+  const newW = Math.round(srcW * ratio);
+  const newH = Math.round(srcH * ratio);
+  const xPad = Math.floor((INPUT_SIZE - newW) / 2);
+  const yPad = Math.floor((INPUT_SIZE - newH) / 2);
+
+  const tmpCanvas = document.createElement("canvas");
+  tmpCanvas.width = INPUT_SIZE;
+  tmpCanvas.height = INPUT_SIZE;
+  const tmpCtx = tmpCanvas.getContext("2d");
+
+  tmpCtx.fillStyle = "rgb(114,114,114)";
+  tmpCtx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
+  tmpCtx.drawImage(sourceCanvas, 0, 0, srcW, srcH, xPad, yPad, newW, newH);
+
+  const imageData = tmpCtx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+  const red = new Float32Array(INPUT_SIZE * INPUT_SIZE);
+  const green = new Float32Array(INPUT_SIZE * INPUT_SIZE);
+  const blue = new Float32Array(INPUT_SIZE * INPUT_SIZE);
+
+  let p = 0;
+  for (let i = 0; i < imageData.length; i += 4) {
+    red[p] = imageData[i] / 255;
+    green[p] = imageData[i + 1] / 255;
+    blue[p] = imageData[i + 2] / 255;
+    p++;
+  }
+
+  const input = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
+  input.set(red, 0);
+  input.set(green, INPUT_SIZE * INPUT_SIZE);
+  input.set(blue, 2 * INPUT_SIZE * INPUT_SIZE);
+
+  const inputTensor = new ort.Tensor("float32", input, [1, 3, INPUT_SIZE, INPUT_SIZE]);
+  return { inputTensor, ratio, xPad, yPad };
+}
+
+function parseYOLOv8Output(outputTensor, confThreshold, originalWidth, originalHeight, ratio, xPad, yPad) {
+  const data = outputTensor.data;
+  const dims = outputTensor.dims;
+  const numClasses = labels.length;
+  let numBoxes;
+  let boxLength;
+  let isTransposed = false;
+
+  if (dims.length !== 3) throw new Error("不支援的模型輸出維度：" + dims.join(","));
+
+  if (dims[1] === 4 + numClasses) {
+    boxLength = dims[1];
+    numBoxes = dims[2];
+    isTransposed = true;
+  } else {
+    numBoxes = dims[1];
+    boxLength = dims[2];
+    isTransposed = false;
+  }
+
+  const detections = [];
+
+  for (let i = 0; i < numBoxes; i++) {
+    const getValue = (j) => isTransposed ? data[j * numBoxes + i] : data[i * boxLength + j];
+
+    const cx = getValue(0);
+    const cy = getValue(1);
+    const w = getValue(2);
+    const h = getValue(3);
 
     let bestScore = -Infinity;
-    let classId = 0;
+    let classId = -1;
 
-    for (let c = 0; c < classCount; c++) {
-      const score = transposed ? data[(4 + c) * rows + i] : data[i * cols + 4 + c];
+    for (let c = 0; c < numClasses; c++) {
+      const score = getValue(4 + c);
       if (score > bestScore) {
         bestScore = score;
         classId = c;
       }
     }
 
-    if (bestScore < CONF_THRESHOLD) continue;
+    if (bestScore < confThreshold) continue;
 
     let x1 = cx - w / 2;
     let y1 = cy - h / 2;
     let x2 = cx + w / 2;
     let y2 = cy + h / 2;
 
-    // 還原 letterbox 前的原圖座標
-    x1 = (x1 - padX) / scale;
-    y1 = (y1 - padY) / scale;
-    x2 = (x2 - padX) / scale;
-    y2 = (y2 - padY) / scale;
+    x1 = (x1 - xPad) / ratio;
+    y1 = (y1 - yPad) / ratio;
+    x2 = (x2 - xPad) / ratio;
+    y2 = (y2 - yPad) / ratio;
 
     x1 = clamp(x1, 0, originalWidth);
     y1 = clamp(y1, 0, originalHeight);
     x2 = clamp(x2, 0, originalWidth);
     y2 = clamp(y2, 0, originalHeight);
 
-    boxes.push({
-      x1,
-      y1,
-      x2,
-      y2,
-      width: x2 - x1,
-      height: y2 - y1,
-      score: bestScore,
-      classId,
-      label: labels[classId] || `class_${classId}`,
-    });
-  }
+    const boxW = x2 - x1;
+    const boxH = y2 - y1;
+    if (boxW <= 1 || boxH <= 1) continue;
 
-  return nonMaxSuppression(boxes, IOU_THRESHOLD);
+    detections.push({ x: x1, y: y1, w: boxW, h: boxH, score: bestScore, classId });
+  }
+  return detections;
 }
 
-function nonMaxSuppression(boxes, iouThreshold) {
-  const sorted = boxes.sort((a, b) => b.score - a.score);
-  const selected = [];
+function nonMaxSuppression(detections, iouThreshold) {
+  const results = [];
+  const grouped = {};
 
-  while (sorted.length > 0) {
-    const current = sorted.shift();
-    selected.push(current);
+  for (const det of detections) {
+    if (!grouped[det.classId]) grouped[det.classId] = [];
+    grouped[det.classId].push(det);
+  }
 
-    for (let i = sorted.length - 1; i >= 0; i--) {
-      const sameClass = sorted[i].classId === current.classId;
-      if (sameClass && iou(current, sorted[i]) > iouThreshold) {
-        sorted.splice(i, 1);
+  for (const classId of Object.keys(grouped)) {
+    const boxes = grouped[classId].sort((a, b) => b.score - a.score);
+    while (boxes.length > 0) {
+      const chosen = boxes.shift();
+      results.push(chosen);
+      for (let i = boxes.length - 1; i >= 0; i--) {
+        if (iou(chosen, boxes[i]) > iouThreshold) boxes.splice(i, 1);
       }
     }
   }
-
-  return selected;
+  return results.sort((a, b) => b.score - a.score);
 }
 
 function iou(a, b) {
-  const x1 = Math.max(a.x1, b.x1);
-  const y1 = Math.max(a.y1, b.y1);
-  const x2 = Math.min(a.x2, b.x2);
-  const y2 = Math.min(a.y2, b.y2);
-
-  const intersection = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-  const areaA = Math.max(0, a.width) * Math.max(0, a.height);
-  const areaB = Math.max(0, b.width) * Math.max(0, b.height);
-  const union = areaA + areaB - intersection;
-
-  return union <= 0 ? 0 : intersection / union;
+  const x1 = Math.max(a.x, b.x);
+  const y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w);
+  const y2 = Math.min(a.y + a.h, b.y + b.h);
+  const interW = Math.max(0, x2 - x1);
+  const interH = Math.max(0, y2 - y1);
+  const interArea = interW * interH;
+  const areaA = a.w * a.h;
+  const areaB = b.w * b.h;
+  return interArea / (areaA + areaB - interArea + 1e-6);
 }
 
-function drawDetections(detections) {
-  const lineWidth = Math.max(2, Math.round(canvas.width / 300));
-  ctx.lineWidth = lineWidth;
-  ctx.font = `${Math.max(16, Math.round(canvas.width / 45))}px system-ui, sans-serif`;
-  ctx.textBaseline = "top";
+function drawDetections(ctx, detections) {
+  ctx.save();
+  for (const det of detections) {
+    const color = CLASS_COLORS[det.classId % CLASS_COLORS.length];
+    const label = labels[det.classId] ?? `類別${det.classId}`;
+    const text = `${label} ${(det.score * 100).toFixed(1)}%`;
+
+    ctx.lineWidth = Math.max(2, Math.round(canvas.width / 400));
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.strokeRect(det.x, det.y, det.w, det.h);
+
+    ctx.font = `${Math.max(16, Math.round(canvas.width / 55))}px Arial, Microsoft JhengHei`;
+    const textMetrics = ctx.measureText(text);
+    const textHeight = Math.max(22, Math.round(canvas.width / 42));
+    const textWidth = textMetrics.width + 12;
+    const textX = det.x;
+    const textY = Math.max(0, det.y - textHeight);
+
+    ctx.fillRect(textX, textY, textWidth, textHeight);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(text, textX + 6, textY + textHeight - 6);
+  }
+  ctx.restore();
+}
+
+function calculateStats(detections) {
+  const stats = {};
+  let totalCount = 0;
+  let totalValue = 0;
+
+  labels.forEach((label, index) => {
+    const unitValue = Number(CLASS_VALUES[index] ?? 0);
+    stats[index] = { classId: index, name: label, count: 0, unitValue, totalValue: 0 };
+  });
 
   detections.forEach((det) => {
-    const text = `${det.label} ${(det.score * 100).toFixed(1)}%`;
-    const textMetrics = ctx.measureText(text);
-    const textHeight = Math.max(22, Math.round(canvas.width / 32));
-
-    ctx.strokeStyle = "#00ff88";
-    ctx.fillStyle = "#00ff88";
-    ctx.strokeRect(det.x1, det.y1, det.width, det.height);
-
-    const labelY = det.y1 - textHeight < 0 ? det.y1 : det.y1 - textHeight;
-    ctx.fillRect(det.x1, labelY, textMetrics.width + 12, textHeight);
-    ctx.fillStyle = "#001b10";
-    ctx.fillText(text, det.x1 + 6, labelY + 3);
+    const classId = Number(det.classId);
+    const unitValue = Number(CLASS_VALUES[classId] ?? 0);
+    if (!stats[classId]) {
+      stats[classId] = { classId, name: labels[classId] ?? `類別${classId}`, count: 0, unitValue, totalValue: 0 };
+    }
+    stats[classId].count += 1;
+    stats[classId].totalValue += unitValue;
+    totalCount += 1;
+    totalValue += unitValue;
   });
 
-  drawCountOverlay(detections);
+  return { stats, totalCount, totalValue };
 }
 
-function drawCountOverlay(detections) {
-  const countMap = countByClass(detections);
-  const lines = [`總數：${detections.length}`];
-  Object.entries(countMap).forEach(([label, count]) => lines.push(`${label}：${count}`));
+function updateStatsTable(detections) {
+  const { stats, totalCount, totalValue } = calculateStats(detections);
+  totalCountEl.textContent = String(totalCount);
+  totalValueEl.textContent = `${totalValue.toLocaleString()} 元`;
+  statsBody.innerHTML = "";
 
-  ctx.font = `${Math.max(18, Math.round(canvas.width / 42))}px system-ui, sans-serif`;
-  const padding = 12;
-  const lineHeight = Math.max(24, Math.round(canvas.width / 32));
-  const boxWidth = Math.max(...lines.map((line) => ctx.measureText(line).width)) + padding * 2;
-  const boxHeight = lines.length * lineHeight + padding;
+  Object.values(stats).forEach((item) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${item.name}</td><td>${item.count}</td><td>${item.unitValue.toLocaleString()} 元</td><td>${item.totalValue.toLocaleString()} 元</td>`;
+    statsBody.appendChild(tr);
+  });
+}
 
-  ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
-  ctx.fillRect(10, 10, boxWidth, boxHeight);
+function initStatsTable() {
+  updateStatsTable([]);
+}
+
+function drawStatsPanel(ctx, detections) {
+  const { stats, totalCount, totalValue } = calculateStats(detections);
+  const lines = [`總數：${totalCount}`, `總價值：${totalValue.toLocaleString()} 元`];
+
+  Object.values(stats).forEach((item) => {
+    lines.push(`${item.name}：${item.count} 個 × ${item.unitValue.toLocaleString()} 元 = ${item.totalValue.toLocaleString()} 元`);
+  });
+
+  ctx.save();
+  const fontSize = Math.max(16, Math.round(canvas.width / 60));
+  const lineHeight = Math.round(fontSize * 1.5);
+  const padding = 10;
+  ctx.font = `${fontSize}px Arial, Microsoft JhengHei`;
+  const maxTextWidth = Math.max(...lines.map((line) => ctx.measureText(line).width));
+  const panelWidth = Math.min(canvas.width - 20, maxTextWidth + padding * 2);
+  const panelHeight = padding * 2 + lines.length * lineHeight;
+
+  ctx.globalAlpha = 0.78;
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(10, 10, panelWidth, panelHeight);
+
+  ctx.globalAlpha = 1;
   ctx.fillStyle = "#ffffff";
-
-  lines.forEach((line, index) => {
-    ctx.fillText(line, 10 + padding, 10 + padding / 2 + index * lineHeight);
-  });
-}
-
-function renderResults(detections) {
-  const countMap = countByClass(detections);
-  summary.textContent = `共偵測到 ${detections.length} 個物件`;
-
-  counts.innerHTML = Object.keys(countMap).length
-    ? Object.entries(countMap)
-        .map(([label, count]) => `<div class="countItem"><strong>${escapeHtml(label)}</strong>：${count}</div>`)
-        .join("")
-    : `<div class="countItem">沒有超過門檻的物件</div>`;
-
-  detectionsBox.innerHTML = detections.length
-    ? detections
-        .map(
-          (det, idx) => `
-          <div class="detItem">
-            <strong>${idx + 1}. ${escapeHtml(det.label)}</strong><br />
-            <small>信心值：${(det.score * 100).toFixed(1)}%；座標：(${Math.round(det.x1)}, ${Math.round(det.y1)})</small>
-          </div>`
-        )
-        .join("")
-    : "";
-}
-
-function countByClass(detections) {
-  return detections.reduce((acc, det) => {
-    acc[det.label] = (acc[det.label] || 0) + 1;
-    return acc;
-  }, {});
+  ctx.textBaseline = "top";
+  lines.forEach((line, index) => ctx.fillText(line, 10 + padding, 10 + padding + index * lineHeight));
+  ctx.restore();
 }
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
-
-function escapeHtml(str) {
-  return String(str)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-init();
